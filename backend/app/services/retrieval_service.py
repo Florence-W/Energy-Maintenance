@@ -25,12 +25,13 @@ from app.schemas.retrieval import (
     RetrievedChunk,
 )
 from app.services.answer_generation_service import AnswerGenerationService
+from app.services.hybrid_retrieval_service import HybridRetrievalService, HybridScoredCandidate
 from app.services.media_service import MediaService, MediaServiceError
 from app.services.model_enhancement_service import ModelEnhancementService
 from app.services.model_prompt_builder import ModelPromptBuilder
 from app.services.knowledge_graph_service import KnowledgeGraphService
 from app.services.query_expansion_service import QueryExpansionService
-from app.services.text_vector_service import TextVectorService
+from app.services.vector_index_service import VectorIndexService
 
 
 MODEL_PROVIDER = "rule_based"
@@ -39,13 +40,6 @@ MODEL_NAME = "keyword_retrieval_v1"
 
 class RetrievalServiceError(ValueError):
     pass
-
-
-@dataclass
-class ScoredCandidate:
-    chunk: KnowledgeChunk
-    document: KnowledgeDocument
-    score: float
 
 
 @dataclass
@@ -64,7 +58,6 @@ class RetrievalService:
         self.answer_service = AnswerGenerationService()
         self.prompt_builder = ModelPromptBuilder()
         self.media_service = MediaService(db)
-        self.vectorizer = TextVectorService()
 
     def query(self, payload: RetrievalQueryRequest, current_user: User) -> RetrievalQueryResponse:
         self._validate_request(payload)
@@ -88,22 +81,45 @@ class RetrievalService:
             candidate_limit=candidate_limit,
         )
         scored_candidates = self._score_candidates(candidates, resolved_payload, expansion.keywords)
-        if resolved_payload.enable_vector_search:
-            vector_candidates = self.repository.list_vector_candidates(
-                manufacturer=resolved_payload.manufacturer,
-                product_series=resolved_payload.product_series,
-                device_type=resolved_payload.device_type,
-                document_type=resolved_payload.document_type,
-                candidate_limit=max(candidate_limit * 3, 240),
+        vector_hits = []
+        vector_diagnostics = {
+            "vector_backend": "dashvector",
+            "vector_available": False,
+            "fallback_reason": None,
+            "raw_vector_hits": 0,
+            "verified_vector_hits": 0,
+            "embedding_provider": None,
+            "embedding_model": None,
+            "embedding_dimension": 0,
+            "warnings": [],
+        }
+        vector_enabled = resolved_payload.enable_vector and resolved_payload.retrieval_mode != "keyword"
+        if vector_enabled:
+            vector_hits, vector_diagnostics = VectorIndexService(self.db).search(
+                resolved_payload.normalized_question,
+                top_k=resolved_payload.vector_top_k,
+                filters={
+                    "manufacturer": resolved_payload.manufacturer,
+                    "product_series": resolved_payload.product_series,
+                    "device_type": resolved_payload.device_type,
+                    "document_type": resolved_payload.document_type,
+                },
             )
-            scored_candidates = self._merge_scored_candidates(
-                scored_candidates,
-                self._score_vector_candidates(vector_candidates, search_payload.normalized_question),
-            )
-        retrieved_chunks = [
-            self._candidate_to_retrieved_chunk(candidate)
-            for candidate in scored_candidates[: resolved_payload.top_k]
-        ]
+        vector_available = bool(vector_diagnostics.get("vector_available") and vector_hits)
+        vector_fallback_used = bool(resolved_payload.retrieval_mode in {"vector", "hybrid"} and not vector_available)
+        actual_mode = resolved_payload.retrieval_mode
+        if actual_mode in {"vector", "hybrid"} and vector_fallback_used:
+            actual_mode = "keyword"
+        merged_candidates = HybridRetrievalService.merge(
+            keyword_candidates=scored_candidates,
+            vector_hits=vector_hits,
+            mode=actual_mode,
+            keyword_weight=resolved_payload.hybrid_keyword_weight,
+            vector_weight=resolved_payload.hybrid_vector_weight,
+            min_score=resolved_payload.min_score,
+            top_k=resolved_payload.top_k,
+        )
+        retrieved_chunks = [self._candidate_to_retrieved_chunk(candidate) for candidate in merged_candidates]
         references = self._build_references(retrieved_chunks)
         related_history = self._find_related_history(resolved_payload, expansion.keywords)
         kg_context = self._resolve_kg_context(resolved_payload, current_user)
@@ -144,6 +160,27 @@ class RetrievalService:
             confidence=answer.confidence,
             model_provider=MODEL_PROVIDER,
             model_name=MODEL_NAME,
+            retrieval_mode=actual_mode,
+            vector_enabled=vector_enabled,
+            vector_available=vector_available,
+            hybrid_used=actual_mode == "hybrid" and any(item.retrieval_source == "hybrid" for item in retrieved_chunks),
+            vector_fallback_used=vector_fallback_used,
+            fallback_used=vector_fallback_used,
+            fallback_reason=vector_diagnostics.get("fallback_reason"),
+            vector_backend=str(vector_diagnostics.get("vector_backend") or "unavailable"),
+            embedding_provider=vector_diagnostics.get("embedding_provider"),
+            embedding_model=vector_diagnostics.get("embedding_model"),
+            retrieval_diagnostics={
+                **vector_diagnostics,
+                "requested_retrieval_mode": resolved_payload.retrieval_mode,
+                "actual_retrieval_mode": actual_mode,
+                "keyword_candidate_count": len(scored_candidates),
+                "vector_hit_count": len(vector_hits),
+                "merged_candidate_count": len(merged_candidates),
+                "hybrid_keyword_weight": resolved_payload.hybrid_keyword_weight,
+                "hybrid_vector_weight": resolved_payload.hybrid_vector_weight,
+                "min_score": resolved_payload.min_score,
+            },
             query_analysis=RetrievalQueryAnalysis(
                 normalized_query=expansion.normalized_query,
                 keywords=expansion.keywords,
@@ -160,6 +197,10 @@ class RetrievalService:
                     "use_ocr_text": resolved_payload.use_ocr_text,
                     "enable_vector_search": resolved_payload.enable_vector_search,
                     "enable_kg_enhancement": resolved_payload.enable_kg_enhancement,
+                    "retrieval_mode": resolved_payload.retrieval_mode,
+                    "actual_retrieval_mode": actual_mode,
+                    "enable_vector": resolved_payload.enable_vector,
+                    "vector_top_k": resolved_payload.vector_top_k,
                 },
             ),
         )
@@ -286,22 +327,45 @@ class RetrievalService:
             candidate_limit=candidate_limit,
         )
         scored_candidates = self._score_candidates(candidates, resolved_payload, expansion.keywords)
-        if resolved_payload.enable_vector_search:
-            vector_candidates = self.repository.list_vector_candidates(
-                manufacturer=resolved_payload.manufacturer,
-                product_series=resolved_payload.product_series,
-                device_type=resolved_payload.device_type,
-                document_type=resolved_payload.document_type,
-                candidate_limit=max(candidate_limit * 3, 240),
+        vector_hits = []
+        vector_diagnostics = {
+            "vector_backend": "dashvector",
+            "vector_available": False,
+            "fallback_reason": None,
+            "raw_vector_hits": 0,
+            "verified_vector_hits": 0,
+            "embedding_provider": None,
+            "embedding_model": None,
+            "embedding_dimension": 0,
+            "warnings": [],
+        }
+        vector_enabled = resolved_payload.enable_vector and resolved_payload.retrieval_mode != "keyword"
+        if vector_enabled:
+            vector_hits, vector_diagnostics = VectorIndexService(self.db).search(
+                resolved_payload.normalized_question,
+                top_k=resolved_payload.vector_top_k,
+                filters={
+                    "manufacturer": resolved_payload.manufacturer,
+                    "product_series": resolved_payload.product_series,
+                    "device_type": resolved_payload.device_type,
+                    "document_type": resolved_payload.document_type,
+                },
             )
-            scored_candidates = self._merge_scored_candidates(
-                scored_candidates,
-                self._score_vector_candidates(vector_candidates, search_payload.normalized_question),
-            )
-        retrieved_chunks = [
-            self._candidate_to_retrieved_chunk(candidate)
-            for candidate in scored_candidates[: resolved_payload.top_k]
-        ]
+        vector_available = bool(vector_diagnostics.get("vector_available") and vector_hits)
+        vector_fallback_used = bool(resolved_payload.retrieval_mode in {"vector", "hybrid"} and not vector_available)
+        actual_mode = resolved_payload.retrieval_mode
+        if actual_mode in {"vector", "hybrid"} and vector_fallback_used:
+            actual_mode = "keyword"
+        merged_candidates = HybridRetrievalService.merge(
+            keyword_candidates=scored_candidates,
+            vector_hits=vector_hits,
+            mode=actual_mode,
+            keyword_weight=resolved_payload.hybrid_keyword_weight,
+            vector_weight=resolved_payload.hybrid_vector_weight,
+            min_score=resolved_payload.min_score,
+            top_k=resolved_payload.top_k,
+        )
+        retrieved_chunks = [self._candidate_to_retrieved_chunk(candidate) for candidate in merged_candidates]
         references = self._build_references(retrieved_chunks)
         related_history = self._find_related_history(resolved_payload, expansion.keywords)
         kg_context = self._resolve_kg_context(resolved_payload, current_user)
@@ -342,6 +406,27 @@ class RetrievalService:
             confidence=answer.confidence,
             model_provider=MODEL_PROVIDER,
             model_name=MODEL_NAME,
+            retrieval_mode=actual_mode,
+            vector_enabled=vector_enabled,
+            vector_available=vector_available,
+            hybrid_used=actual_mode == "hybrid" and any(item.retrieval_source == "hybrid" for item in retrieved_chunks),
+            vector_fallback_used=vector_fallback_used,
+            fallback_used=vector_fallback_used,
+            fallback_reason=vector_diagnostics.get("fallback_reason"),
+            vector_backend=str(vector_diagnostics.get("vector_backend") or "unavailable"),
+            embedding_provider=vector_diagnostics.get("embedding_provider"),
+            embedding_model=vector_diagnostics.get("embedding_model"),
+            retrieval_diagnostics={
+                **vector_diagnostics,
+                "requested_retrieval_mode": resolved_payload.retrieval_mode,
+                "actual_retrieval_mode": actual_mode,
+                "keyword_candidate_count": len(scored_candidates),
+                "vector_hit_count": len(vector_hits),
+                "merged_candidate_count": len(merged_candidates),
+                "hybrid_keyword_weight": resolved_payload.hybrid_keyword_weight,
+                "hybrid_vector_weight": resolved_payload.hybrid_vector_weight,
+                "min_score": resolved_payload.min_score,
+            },
             query_analysis=RetrievalQueryAnalysis(
                 normalized_query=expansion.normalized_query,
                 keywords=expansion.keywords,
@@ -358,6 +443,10 @@ class RetrievalService:
                     "use_ocr_text": resolved_payload.use_ocr_text,
                     "enable_vector_search": resolved_payload.enable_vector_search,
                     "enable_kg_enhancement": resolved_payload.enable_kg_enhancement,
+                    "retrieval_mode": resolved_payload.retrieval_mode,
+                    "actual_retrieval_mode": actual_mode,
+                    "enable_vector": resolved_payload.enable_vector,
+                    "vector_top_k": resolved_payload.vector_top_k,
                 },
             ),
         )
@@ -405,6 +494,16 @@ class RetrievalService:
             raise RetrievalServiceError("query or question must not be empty")
         if payload.top_k < 1 or payload.top_k > 10:
             raise RetrievalServiceError("top_k must be between 1 and 10")
+        if payload.vector_top_k < 1 or payload.vector_top_k > 20:
+            raise RetrievalServiceError("vector_top_k must be between 1 and 20")
+        if payload.retrieval_mode not in {"keyword", "vector", "hybrid"}:
+            raise RetrievalServiceError("retrieval_mode must be keyword, vector, or hybrid")
+        if payload.hybrid_keyword_weight < 0 or payload.hybrid_vector_weight < 0:
+            raise RetrievalServiceError("hybrid weights must be non-negative")
+        if payload.hybrid_keyword_weight + payload.hybrid_vector_weight <= 0:
+            raise RetrievalServiceError("hybrid weights must not both be zero")
+        if payload.min_score < 0 or payload.min_score > 1:
+            raise RetrievalServiceError("min_score must be between 0 and 1")
         if payload.manufacturer and payload.manufacturer not in ALLOWED_MANUFACTURERS:
             raise RetrievalServiceError("manufacturer must be huawei or sungrow")
         if payload.product_series and payload.product_series not in ALLOWED_PRODUCT_SERIES:
@@ -449,54 +548,23 @@ class RetrievalService:
         candidates: list[tuple[KnowledgeChunk, KnowledgeDocument]],
         payload: RetrievalQueryRequest,
         keywords: list[str],
-    ) -> list[ScoredCandidate]:
-        scored: list[ScoredCandidate] = []
+    ) -> list[HybridScoredCandidate]:
+        scored: list[HybridScoredCandidate] = []
         for chunk, document in candidates:
             score = self._score_candidate(chunk, document, payload, keywords)
             if score <= 0:
                 continue
-            scored.append(ScoredCandidate(chunk=chunk, document=document, score=round(score, 2)))
+            scored.append(
+                HybridScoredCandidate(
+                    chunk=chunk,
+                    document=document,
+                    score=round(score, 2),
+                    keyword_score=round(score, 2),
+                    retrieval_source="keyword",
+                )
+            )
         scored.sort(key=lambda item: item.score, reverse=True)
         return scored
-
-    def _score_vector_candidates(
-        self,
-        candidates: list[tuple[KnowledgeChunk, KnowledgeDocument]],
-        query: str,
-    ) -> list[ScoredCandidate]:
-        query_vector = self.vectorizer.vectorize(query)
-        if not query_vector:
-            return []
-        scored: list[ScoredCandidate] = []
-        for chunk, document in candidates:
-            chunk_vector = self.vectorizer.vector_from_metadata(chunk.metadata_json)
-            if not chunk_vector:
-                chunk_vector = self.vectorizer.vectorize(chunk.content or "")
-            similarity = self.vectorizer.cosine_similarity(query_vector, chunk_vector)
-            if similarity <= 0.02:
-                continue
-            score = 4.0 + similarity * 28.0
-            scored.append(ScoredCandidate(chunk=chunk, document=document, score=round(score, 2)))
-        scored.sort(key=lambda item: item.score, reverse=True)
-        return scored
-
-    @staticmethod
-    def _merge_scored_candidates(
-        keyword_candidates: list[ScoredCandidate],
-        vector_candidates: list[ScoredCandidate],
-    ) -> list[ScoredCandidate]:
-        merged: dict[UUID, ScoredCandidate] = {}
-        for candidate in keyword_candidates:
-            merged[candidate.chunk.id] = candidate
-        for candidate in vector_candidates:
-            existing = merged.get(candidate.chunk.id)
-            if existing:
-                existing.score = round(max(existing.score, candidate.score) + min(candidate.score, 8.0) * 0.25, 2)
-            else:
-                merged[candidate.chunk.id] = candidate
-        result = list(merged.values())
-        result.sort(key=lambda item: item.score, reverse=True)
-        return result
 
     def _score_candidate(
         self,
@@ -545,7 +613,7 @@ class RetrievalService:
         return len(re.findall(re.escape(keyword.lower()), text.lower()))
 
     @staticmethod
-    def _candidate_to_retrieved_chunk(candidate: ScoredCandidate) -> RetrievedChunk:
+    def _candidate_to_retrieved_chunk(candidate: HybridScoredCandidate) -> RetrievedChunk:
         chunk = candidate.chunk
         document = candidate.document
         return RetrievedChunk(
@@ -563,6 +631,11 @@ class RetrievalService:
             document_type=document.document_type,
             source=document.source,
             created_at=chunk.created_at,
+            keyword_score=candidate.keyword_score,
+            vector_score=candidate.vector_score,
+            hybrid_score=candidate.hybrid_score,
+            retrieval_source=candidate.retrieval_source,
+            vector_backend=candidate.vector_backend,
         )
 
     def _build_references(self, chunks: list[RetrievedChunk]) -> list[RetrievalReference]:
@@ -685,6 +758,19 @@ class RetrievalService:
                     **self._kg_context_summary(response.kg_context),
                 }
             )
+        stored_history.append(
+            {
+                "record_type": "retrieval_diagnostics",
+                "retrieval_mode": response.retrieval_mode,
+                "vector_backend": response.vector_backend,
+                "vector_available": response.vector_available,
+                "hybrid_used": response.hybrid_used,
+                "vector_fallback_used": response.vector_fallback_used,
+                "embedding_provider": response.embedding_provider,
+                "embedding_model": response.embedding_model,
+                "diagnostics": response.retrieval_diagnostics,
+            }
+        )
         record = QARecord(
             trace_id=response.trace_id,
             device_id=payload.device_id,
